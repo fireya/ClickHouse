@@ -413,15 +413,15 @@ String MergeTreeData::MergingParams::getModeName() const
 }
 
 
-Int64 MergeTreeData::getMaxDataPartIndex()
+Int64 MergeTreeData::getMaxDataPartVersion()
 {
     std::lock_guard<std::mutex> lock_all(data_parts_mutex);
 
-    Int64 max_block_id = 0;
+    Int64 max_version = 0;
     for (const DataPartPtr & part : data_parts_by_info)
-        max_block_id = std::max(max_block_id, part->info.max_block);
+        max_version = std::max(max_version, part->info.version);
 
-    return max_block_id;
+    return max_version;
 }
 
 
