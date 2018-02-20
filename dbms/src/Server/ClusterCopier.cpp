@@ -46,6 +46,7 @@
 #include <Parsers/queryToString.h>
 #include <Parsers/ASTDropQuery.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTExpressionList.h>
 #include <Databases/DatabaseMemory.h>
 #include <DataStreams/RemoteBlockInputStream.h>
 #include <DataStreams/SquashingBlockInputStream.h>
@@ -204,9 +205,16 @@ struct TaskShard
     UInt32 numberInCluster() const { return info.shard_num; }
     UInt32 indexInCluster() const { return info.shard_num - 1; }
 
-    TasksPartition partitions;
+    TasksPartition partition_tasks;
 
     ShardPriority priority;
+
+    ColumnWithTypeAndName partition_key_column;
+    ASTPtr current_pull_table_create_query;
+
+    /// Internal distributed tables
+    DatabaseAndTableName table_read_shard;
+    DatabaseAndTableName table_split_shard;
 };
 
 struct TaskTable
@@ -235,6 +243,7 @@ struct TaskTable
     /// Storage of destination table
     String engine_push_str;
     ASTPtr engine_push_ast;
+    ASTPtr engine_push_partition_key_ast;
 
     /// Local Distributed table used to split data
     DatabaseAndTableName table_split;
@@ -252,7 +261,8 @@ struct TaskTable
 
     /// Filter partitions that should be copied
     bool has_enabled_partitions = false;
-    NameSet enabled_partitions;
+    Strings enabled_partitions;
+    NameSet enabled_partitions_set;
 
     /// Prioritized list of shards
     TasksShard all_shards;
@@ -427,6 +437,50 @@ String TaskTable::getPartitionIsDirtyPath(const String & partition_name) const
 }
 
 
+static bool isExtedndedDefinitionStorage(const ASTPtr & storage_ast)
+{
+    const ASTStorage & storage = typeid_cast<const ASTStorage &>(*storage_ast);
+    return storage.partition_by || storage.order_by || storage.sample_by;
+}
+
+static ASTPtr extractPartitionKey(const ASTPtr & storage_ast)
+{
+    String storage_str = queryToString(storage_ast);
+
+    const ASTStorage & storage = typeid_cast<const ASTStorage &>(*storage_ast);
+    const ASTFunction & engine = typeid_cast<const ASTFunction &>(*storage.engine);
+
+    if (!endsWith(engine.name, "MergeTree"))
+    {
+        throw Exception("Unsupported engine was specified in " + storage_str + ", only *MergeTree engines are supported",
+                        ErrorCodes::BAD_ARGUMENTS);
+    }
+
+    ASTPtr arguments_ast = engine.arguments->clone();
+    ASTs & arguments = typeid_cast<ASTExpressionList &>(*arguments_ast).children;
+
+    if (isExtedndedDefinitionStorage(storage_ast))
+    {
+        if (storage.partition_by)
+            return storage.partition_by->clone();
+
+        static const char * all = "all";
+        return std::make_shared<ASTLiteral>(StringRange(all, all + strlen(all)), Field(all, strlen(all)));
+    }
+    else
+    {
+        bool is_replicated = startsWith(engine.name, "Replicated");
+        size_t min_args = is_replicated ? 3 : 1;
+
+        if (arguments.size() < min_args)
+            throw Exception("Expected at least " + toString(min_args) + " arguments in " + storage_str, ErrorCodes::BAD_ARGUMENTS);
+
+        ASTPtr & month_arg = is_replicated ? arguments[2] : arguments[1];
+        return makeASTFunction("toYYYYMM", month_arg->clone());
+    }
+}
+
+
 TaskTable::TaskTable(TaskCluster & parent, const Poco::Util::AbstractConfiguration & config, const String & prefix_,
                      const String & table_key)
 : task_cluster(parent)
@@ -453,6 +507,7 @@ TaskTable::TaskTable(TaskCluster & parent, const Poco::Util::AbstractConfigurati
     {
         ParserStorage parser_storage;
         engine_push_ast = parseQuery(parser_storage, engine_push_str);
+        engine_push_partition_key_ast = extractPartitionKey(engine_push_ast);
     }
 
     sharding_key_str = config.getString(table_prefix + "sharding_key");
@@ -482,13 +537,12 @@ TaskTable::TaskTable(TaskCluster & parent, const Poco::Util::AbstractConfigurati
         Strings keys;
         config.keys(enabled_partitions_prefix, keys);
 
-        Strings partitions;
         if (keys.empty())
         {
             /// Parse list of partition from space-separated string
             String partitions_str = config.getString(table_prefix + "enabled_partitions");
             boost::trim_if(partitions_str, isWhitespaceASCII);
-            boost::split(partitions, partitions_str, isWhitespaceASCII, boost::token_compress_on);
+            boost::split(enabled_partitions, partitions_str, isWhitespaceASCII, boost::token_compress_on);
         }
         else
         {
@@ -498,13 +552,12 @@ TaskTable::TaskTable(TaskCluster & parent, const Poco::Util::AbstractConfigurati
                 if (!startsWith(key, "partition"))
                     throw Exception("Unknown key " + key + " in " + enabled_partitions_prefix, ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG);
 
-                partitions.emplace_back(config.getString(enabled_partitions_prefix + "." + key));
+                enabled_partitions.emplace_back(config.getString(enabled_partitions_prefix + "." + key));
             }
         }
 
-        std::copy(partitions.begin(), partitions.end(), std::inserter(enabled_partitions, enabled_partitions.begin()));
+        std::copy(enabled_partitions.begin(), enabled_partitions.end(), std::inserter(enabled_partitions_set, enabled_partitions_set.begin()));
     }
-
 }
 
 
@@ -670,7 +723,7 @@ public:
 
         LOG_DEBUG(log, "Loaded " << task_cluster->table_tasks.size() << " table tasks");
 
-        /// Compute set of partitions, set of partitions aren't changed
+        /// Compute set of partitions, assume set of partitions aren't changed during the processing
         for (auto & task_table : task_cluster->table_tasks)
         {
             for (const TaskShardPtr & task_shard : task_table.all_shards)
@@ -686,31 +739,50 @@ public:
                                << ", table " << getDatabaseDotTable(task_table.table_pull)
                                << ", shard " << task_shard->info.shard_num << ")");
 
-                LOG_DEBUG(log, "There are "
-                    << task_table.all_shards.size() << " shards, "
-                    << task_table.local_shards.size() << " of them are remote ones");
+                LOG_DEBUG(log, "There are " << task_table.all_shards.size() << " shards, "
+                    << task_table.local_shards.size() << " of them are local ones");
 
-                auto connection_entry = task_shard->info.pool->get(&task_cluster->settings_pull);
-                LOG_DEBUG(log, "Will get meta information for shard " << task_shard->numberInCluster()
-                               << " from replica " << connection_entry->getDescription());
+                LOG_DEBUG(log, "Fetching meta information for shard " << task_shard->numberInCluster());
 
-                Strings partitions = getRemotePartitions(task_table.table_pull, *connection_entry, &task_cluster->settings_pull);
-                for (const String & partition_name : partitions)
+                auto existing_partitions_names = getShardPartitions(*task_shard);
+                Strings filtered_partitions_names;
+
+                if (task_table.has_enabled_partitions)
                 {
-                    /// Do not process partition if it is not in enabled_partitions list
-                    if (task_table.has_enabled_partitions && !task_table.enabled_partitions.count(partition_name))
+                    /// Process partition in order specified by <enabled_partitions/>
+                    for (const String & partition_name : task_table.enabled_partitions)
                     {
-                        LOG_DEBUG(log, "Will skip partition " << partition_name);
-                        continue;
+                        auto it = existing_partitions_names.find(partition_name);
+
+                        /// Do not process partition if it is not in enabled_partitions list
+                        if (it == existing_partitions_names.end())
+                            continue;
+
+                        filtered_partitions_names.emplace_back(*it);
                     }
 
-                    task_shard->partitions.emplace(partition_name, TaskPartition(*task_shard, partition_name));
+                    for (const String & partition_name : existing_partitions_names)
+                    {
+                        if (!task_table.enabled_partitions_set.count(partition_name))
+                            LOG_DEBUG(log, "Partition " << partition_name << " will not be processed, since it is not in enabled_partitions");
+                    }
+                }
+                else
+                {
+                    for (const String & partition_name : existing_partitions_names)
+                        filtered_partitions_names.emplace_back(partition_name);
+                }
+
+                for (const String & partition_name : filtered_partitions_names)
+                {
+                    task_shard->partition_tasks.emplace(partition_name, TaskPartition(*task_shard, partition_name));
 
                     ClusterPartition & cluster_partition = task_table.cluster_partitions[partition_name];
                     cluster_partition.shards.emplace_back(task_shard);
                 }
 
-                LOG_DEBUG(log, "Will fetch " << task_shard->partitions.size() << " partitions");
+                LOG_DEBUG(log, "Will copy " << task_shard->partition_tasks.size() << " partitions from shard "
+                                            << task_shard->numberInCluster());
             }
         }
 
@@ -786,8 +858,8 @@ public:
                 /// NOTE: shards are sorted by "distance" to current host
                 for (const TaskShardPtr & shard : shards_with_partition)
                 {
-                    auto it_shard_partition = shard->partitions.find(partition_name);
-                    if (it_shard_partition == shard->partitions.end())
+                    auto it_shard_partition = shard->partition_tasks.find(partition_name);
+                    if (it_shard_partition == shard->partition_tasks.end())
                         throw Exception("There are no such partition in a shard. This is a bug.", ErrorCodes::LOGICAL_ERROR);
 
                     TaskPartition & task_shard_partition = it_shard_partition->second;
@@ -905,7 +977,7 @@ public:
         Strings status_paths;
         for (auto & shard : shards_with_partition)
         {
-            TaskPartition & task_shard_partition = shard->partitions.find(partition_name)->second;
+            TaskPartition & task_shard_partition = shard->partition_tasks.find(partition_name)->second;
             status_paths.emplace_back(task_shard_partition.getShardStatusPath());
         }
 
@@ -998,6 +1070,7 @@ protected:
         }
     }
 
+    /// Removes MATERIALIZED and ALIAS columns from create table query
     static ASTPtr removeAliasColumnsFromCreateQuery(const ASTPtr & query_ast)
     {
         const ASTs & column_asts = typeid_cast<ASTCreateQuery &>(*query_ast).columns->children;
@@ -1025,6 +1098,7 @@ protected:
         return new_query_ast;
     }
 
+    /// Replaces ENGINE and table name in a create query
     std::shared_ptr<ASTCreateQuery> rewriteCreateQueryStorage(const ASTPtr & create_query_ast, const DatabaseAndTableName & new_table, const ASTPtr & new_storage_ast)
     {
         ASTCreateQuery & create = typeid_cast<ASTCreateQuery &>(*create_query_ast);
@@ -1172,7 +1246,7 @@ protected:
         {
             String query;
             query += "SELECT " + fields + " FROM " + getDatabaseDotTable(from_table);
-            query += " WHERE (_part LIKE '" + task_partition.name + "%')";
+            query += " WHERE (" + queryToString(task_table.engine_push_partition_key_ast) + " = " + task_partition.name + ")";
             if (!task_table.where_condition_str.empty())
                 query += " AND (" + task_table.where_condition_str + ")";
             if (!limit.empty())
@@ -1245,45 +1319,13 @@ protected:
 
         zookeeper->createAncestors(current_task_status_path);
 
-        /// We need to update table definitions for each part, it could be changed after ALTER
-        ASTPtr query_create_pull_table;
-        {
-            /// Fetch and parse (possibly) new definition
-            auto connection_entry = task_shard.info.pool->get(&task_cluster->settings_pull);
-            String create_query_pull_str = getRemoteCreateTable(task_table.table_pull, *connection_entry, &task_cluster->settings_pull);
-
-            ParserCreateQuery parser_create_query;
-            query_create_pull_table = parseQuery(parser_create_query, create_query_pull_str);
-        }
-
-        /// Create local Distributed tables:
-        ///  a table fetching data from current shard and a table inserting data to the whole destination cluster
-        DatabaseAndTableName table_shard(working_database_name, ".read_shard." + task_table.table_id);
-        DatabaseAndTableName table_split(working_database_name, ".split." + task_table.table_id);
-        {
-            /// Create special cluster with single shard
-            String shard_read_cluster_name = ".read_shard." + task_table.cluster_pull_name;
-            ClusterPtr cluster_pull_current_shard = task_table.cluster_pull->getClusterWithSingleShard(task_shard.indexInCluster());
-            context.setCluster(shard_read_cluster_name, cluster_pull_current_shard);
-
-            auto storage_shard_ast = createASTStorageDistributed(shard_read_cluster_name, task_table.table_pull.first, task_table.table_pull.second);
-            const auto & storage_split_ast = task_table.engine_split_ast;
-
-            auto create_query_ast = removeAliasColumnsFromCreateQuery(query_create_pull_table);
-            auto create_table_pull_ast = rewriteCreateQueryStorage(create_query_ast, table_shard, storage_shard_ast);
-            auto create_table_split_ast = rewriteCreateQueryStorage(create_query_ast, table_split, storage_split_ast);
-
-            //LOG_DEBUG(log, "Create shard reading table. Query: " << queryToString(create_table_pull_ast));
-            dropAndCreateLocalTable(create_table_pull_ast);
-
-            //LOG_DEBUG(log, "Create split table. Query: " << queryToString(create_table_split_ast));
-            dropAndCreateLocalTable(create_table_split_ast);
-        }
+        /// We need to update table definitions for each partition, it could be changed after ALTER
+        createShardInternalTables(task_shard);
 
         /// Check that destination partition is empty if we are first worker
         /// NOTE: this check is incorrect if pull and push tables have different partition key!
         {
-            ASTPtr query_select_ast = get_select_query(table_split, "count()");
+            ASTPtr query_select_ast = get_select_query(task_shard.table_split_shard, "count()");
             UInt64 count;
             {
                 Context local_context = context;
@@ -1292,9 +1334,8 @@ protected:
                 local_context.getSettingsRef().skip_unavailable_shards = true;
 
                 InterpreterSelectQuery interperter(query_select_ast, local_context);
-                BlockIO io = interperter.execute();
 
-                Block block = getBlockWithAllStreamData(io.in);
+                Block block = getBlockWithAllStreamData(interperter.execute().in);
                 count = (block) ? block.safeGetByPosition(0).column->getUInt(0) : 0;
             }
 
@@ -1337,7 +1378,7 @@ protected:
 
         /// Try create table (if not exists) on each shard
         {
-            auto create_query_push_ast = rewriteCreateQueryStorage(query_create_pull_table, task_table.table_push, task_table.engine_push_ast);
+            auto create_query_push_ast = rewriteCreateQueryStorage(task_shard.current_pull_table_create_query, task_table.table_push, task_table.engine_push_ast);
             typeid_cast<ASTCreateQuery &>(*create_query_push_ast).if_not_exists = true;
             String query = queryToString(create_query_push_ast);
 
@@ -1359,14 +1400,14 @@ protected:
             }
 
             // Select all fields
-            ASTPtr query_select_ast = get_select_query(table_shard, "*", inject_fault ? "1" : "");
+            ASTPtr query_select_ast = get_select_query(task_shard.table_read_shard, "*", inject_fault ? "1" : "");
 
             LOG_DEBUG(log, "Executing SELECT query: " << queryToString(query_select_ast));
 
             ASTPtr query_insert_ast;
             {
                 String query;
-                query += "INSERT INTO " + getDatabaseDotTable(table_split) + " VALUES ";
+                query += "INSERT INTO " + getDatabaseDotTable(task_shard.table_split_shard) + " VALUES ";
 
                 ParserQuery p_query(query.data() + query.size());
                 query_insert_ast = parseQuery(p_query, query);
@@ -1521,6 +1562,94 @@ protected:
         return typeid_cast<const ColumnString &>(*block.safeGetByPosition(0).column).getDataAt(0).toString();
     }
 
+    ASTPtr getCreateTableForPullShard(TaskShard & task_shard)
+    {
+        /// Fetch and parse (possibly) new definition
+        auto connection_entry = task_shard.info.pool->get(&task_cluster->settings_pull);
+        String create_query_pull_str = getRemoteCreateTable(task_shard.task_table.table_pull, *connection_entry,
+                                                            &task_cluster->settings_pull);
+
+        ParserCreateQuery parser_create_query;
+        return parseQuery(parser_create_query, create_query_pull_str);
+    }
+
+    void createShardInternalTables(TaskShard & task_shard)
+    {
+        TaskTable & task_table = task_shard.task_table;
+
+        /// We need to update table definitions for each part, it could be changed after ALTER
+        task_shard.current_pull_table_create_query = getCreateTableForPullShard(task_shard);
+
+        /// Create local Distributed tables:
+        ///  a table fetching data from current shard and a table inserting data to the whole destination cluster
+        String read_shard_prefix = ".read_shard_" + toString(task_shard.indexInCluster()) + ".";
+        String split_shard_prefix = ".split.";
+        task_shard.table_read_shard = DatabaseAndTableName(working_database_name, read_shard_prefix + task_table.table_id);
+        task_shard.table_split_shard = DatabaseAndTableName(working_database_name, split_shard_prefix + task_table.table_id);
+
+        /// Create special cluster with single shard
+        String shard_read_cluster_name = read_shard_prefix + task_table.cluster_pull_name;
+        ClusterPtr cluster_pull_current_shard = task_table.cluster_pull->getClusterWithSingleShard(task_shard.indexInCluster());
+        context.setCluster(shard_read_cluster_name, cluster_pull_current_shard);
+
+        auto storage_shard_ast = createASTStorageDistributed(shard_read_cluster_name, task_table.table_pull.first, task_table.table_pull.second);
+        const auto & storage_split_ast = task_table.engine_split_ast;
+
+        auto create_query_ast = removeAliasColumnsFromCreateQuery(task_shard.current_pull_table_create_query);
+        auto create_table_pull_ast = rewriteCreateQueryStorage(create_query_ast, task_shard.table_read_shard, storage_shard_ast);
+        auto create_table_split_ast = rewriteCreateQueryStorage(create_query_ast, task_shard.table_split_shard, storage_split_ast);
+
+        //LOG_DEBUG(log, "Create shard reading table. Query: " << queryToString(create_table_pull_ast));
+        dropAndCreateLocalTable(create_table_pull_ast);
+
+        //LOG_DEBUG(log, "Create split table. Query: " << queryToString(create_table_split_ast));
+        dropAndCreateLocalTable(create_table_split_ast);
+    }
+
+
+    std::set<String> getShardPartitions(TaskShard & task_shard)
+    {
+        createShardInternalTables(task_shard);
+
+        TaskTable & task_table = task_shard.task_table;
+
+        String query;
+        {
+            WriteBufferFromOwnString wb;
+            wb << "SELECT DISTINCT " << queryToString(task_table.engine_push_partition_key_ast) << " AS partition FROM"
+               << " " << getDatabaseDotTable(task_shard.table_read_shard) << " ORDER BY partition DESC";
+            query = wb.str();
+        }
+
+        LOG_DEBUG(log, "Execute query: " << query);
+        LOG_DEBUG(log, queryToString(task_shard.current_pull_table_create_query));
+
+        ParserQuery parser_query(query.data() + query.size());
+        ASTPtr query_ast = parseQuery(parser_query, query);
+
+        Context local_context = context;
+        InterpreterSelectQuery interp(query_ast, local_context);
+        Block block = getBlockWithAllStreamData(interp.execute().in);
+
+        std::set<String> res;
+        if (!block)
+            return res;
+
+        LOG_DEBUG(log, "Fetched " << block.rows() << " rows");
+
+        ColumnWithTypeAndName & column = block.getByPosition(0);
+        task_shard.partition_key_column = column;
+
+        for (size_t i = 0; i < column.column->size(); ++i)
+        {
+            WriteBufferFromOwnString wb;
+            column.type->serializeTextQuoted(*column.column, i, wb);
+            res.emplace(wb.str());
+        }
+
+        return res;
+    }
+
     Strings getRemotePartitions(const DatabaseAndTableName & table, Connection & connection, const Settings * settings = nullptr)
     {
         Block block;
@@ -1610,7 +1739,7 @@ protected:
                 Settings current_settings = settings ? *settings : task_cluster->settings_common;
                 current_settings.max_parallel_replicas = num_remote_replicas ? num_remote_replicas : 1;
 
-                std::vector<IConnectionPool::Entry> connections = shard.pool->getMany(&current_settings, pool_mode);
+                auto connections = shard.pool->getMany(&current_settings, pool_mode);
 
                 for (auto & connection : connections)
                 {
@@ -1619,7 +1748,8 @@ protected:
 
                     try
                     {
-                        RemoteBlockInputStream stream(*connection, query, context, &current_settings);
+                        /// CREATE TABLE and DROP PARTITION return empty block
+                        RemoteBlockInputStream stream(*connection, query, Block(), context, &current_settings);
                         NullBlockOutputStream output;
                         copyData(stream, output);
 
@@ -1840,7 +1970,7 @@ int ClusterCopierApp::main(const std::vector<std::string> &)
     }
     catch (...)
     {
-        std::cerr << DB::getCurrentExceptionMessage(true) << "\n";
+        tryLogCurrentException(&Poco::Logger::root(), __PRETTY_FUNCTION__);
         auto code = getCurrentExceptionCode();
 
         return (code) ? code : -1;
